@@ -42,6 +42,9 @@ jobs:
     if: needs.version.outputs.build == 'true'
     runs-on: windows-2022
     timeout-minutes: 300
+    env:
+      CMAKE_GENERATOR: Ninja
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,7 +53,18 @@ jobs:
         shell: pwsh
         env:
           UPSTREAM_TAG: ${{ needs.version.outputs.tag }}
-        run: ./build.ps1 -Tag $env:UPSTREAM_TAG -PrepareOnly
+        run: |
+          git config --global core.longpaths true
+          ./build.ps1 -Tag $env:UPSTREAM_TAG -PrepareOnly
+      - name: Install the Windows installer compiler
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.1-x64.exe'
+          $dir = Join-Path $env:RUNNER_TEMP 'inno'
+          curl.exe -fLsS --retry 3 -o $setup 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe'
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash $setup).Hash -ine '8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0') { throw 'Inno Setup download failed verification' }
+          $process = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',("/DIR=`"$dir`"") -WindowStyle Hidden -PassThru -Wait
+          if ($process.ExitCode -ne 0 -or !(Test-Path "$dir\ISCC.exe")) { throw 'Inno Setup installation failed' }
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: build/zed-${{ needs.version.outputs.tag }} -> ../target
@@ -59,7 +73,7 @@ jobs:
         shell: pwsh
         env:
           UPSTREAM_TAG: ${{ needs.version.outputs.tag }}
-        run: ./build.ps1 -Tag $env:UPSTREAM_TAG -ReleaseRepository $env:GITHUB_REPOSITORY
+        run: ./build.ps1 -Tag $env:UPSTREAM_TAG -ReleaseRepository $env:GITHUB_REPOSITORY -Iscc "$env:RUNNER_TEMP\inno\ISCC.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: release
