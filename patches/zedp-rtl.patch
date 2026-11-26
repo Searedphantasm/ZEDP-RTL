@@ -1,0 +1,1481 @@
+diff --git a/crates/auto_update/src/auto_update.rs b/crates/auto_update/src/auto_update.rs
+index 38324d5..66caf63 100644
+--- a/crates/auto_update/src/auto_update.rs
++++ b/crates/auto_update/src/auto_update.rs
+@@ -45,6 +45,7 @@ impl std::fmt::Display for MissingDependencyError {
+ 
+ impl std::error::Error for MissingDependencyError {}
+ const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
++const ZEDP_RELEASE_REPO: Option<&str> = option_env!("ZEDP_RELEASE_REPO");
+ const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+ const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
+ 
+@@ -123,6 +124,10 @@ pub struct AssetQuery<'a> {
+ pub enum AutoUpdateStatus {
+     Idle,
+     Checking,
++    CommunityRelease {
++        version: Version,
++        url: String,
++    },
+     Downloading {
+         version: Version,
+         /// Download progress as a fraction in the range `0.0..=1.0`, or `None`
+@@ -147,6 +152,10 @@ impl PartialEq for AutoUpdateStatus {
+         match (self, other) {
+             (AutoUpdateStatus::Idle, AutoUpdateStatus::Idle) => true,
+             (AutoUpdateStatus::Checking, AutoUpdateStatus::Checking) => true,
++            (
++                AutoUpdateStatus::CommunityRelease { version: a, .. },
++                AutoUpdateStatus::CommunityRelease { version: b, .. },
++            ) => a == b,
+             (
+                 AutoUpdateStatus::Downloading { version: v1, .. },
+                 AutoUpdateStatus::Downloading { version: v2, .. },
+@@ -284,6 +293,7 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
+ 
+         if option_env!("ZED_UPDATE_EXPLANATION").is_none()
+             && env::var("ZED_UPDATE_EXPLANATION").is_err()
++            && (!cfg!(target_os = "windows") || ZEDP_RELEASE_REPO.is_some())
+             && poll_for_updates
+         {
+             let mut update_subscription = AutoUpdateSetting::get_global(cx)
+@@ -308,6 +318,16 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
+ }
+ 
+ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
++    if cfg!(target_os = "windows") && ZEDP_RELEASE_REPO.is_none() {
++        drop(window.prompt(
++            gpui::PromptLevel::Info,
++            "ZEDP-RTL local build",
++            Some("This build has no published ZEDP-RTL release channel."),
++            &["OK"],
++            cx,
++        ));
++        return;
++    }
+     if let Some(message) = option_env!("ZED_UPDATE_EXPLANATION")
+         .map(ToOwned::to_owned)
+         .or_else(|| env::var("ZED_UPDATE_EXPLANATION").ok())
+@@ -748,6 +768,65 @@ impl AutoUpdater {
+                 )
+             });
+ 
++        if cfg!(target_os = "windows") {
++            let repo = ZEDP_RELEASE_REPO.context("No ZEDP-RTL release channel configured")?;
++            let mut response = client
++                .get(
++                    &format!("https://api.github.com/repos/{repo}/releases/latest"),
++                    Default::default(),
++                    true,
++                )
++                .await?;
++            anyhow::ensure!(
++                response.status().is_success(),
++                "GitHub release check returned {}",
++                response.status()
++            );
++            #[derive(Deserialize)]
++            struct Asset {
++                name: String,
++            }
++            #[derive(Deserialize)]
++            struct Release {
++                tag_name: String,
++                draft: bool,
++                prerelease: bool,
++                assets: Vec<Asset>,
++            }
++            let mut body = Vec::new();
++            response.body_mut().read_to_end(&mut body).await?;
++            let release: Release = serde_json::from_slice(&body)?;
++            let version = Version::parse(
++                release
++                    .tag_name
++                    .strip_prefix('v')
++                    .context("Expected a stable version tag")?,
++            )?;
++            anyhow::ensure!(
++                !release.draft && !release.prerelease && version.pre.is_empty(),
++                "Expected a stable release"
++            );
++            anyhow::ensure!(
++                release
++                    .assets
++                    .iter()
++                    .any(|asset| asset.name == format!("ZEDP-RTL-{version}-x64.exe")),
++                "The Windows installer is missing"
++            );
++            this.update(cx, |this, cx| {
++                this.status = if version > installed_version {
++                    let url = format!("https://github.com/{repo}/releases/tag/v{version}");
++                    AutoUpdateStatus::CommunityRelease { version, url }
++                } else {
++                    if this.update_check_type.is_manual() {
++                        cx.emit(AutoUpdateEvent::UpToDate);
++                    }
++                    AutoUpdateStatus::Idle
++                };
++                cx.notify();
++            });
++            return Ok(());
++        }
+         Self::check_dependencies()?;
+ 
+         this.update(cx, |this, cx| {
+diff --git a/crates/cli/src/main.rs b/crates/cli/src/main.rs
+index 6d1bacd..bef6973 100644
+--- a/crates/cli/src/main.rs
++++ b/crates/cli/src/main.rs
+@@ -1163,7 +1163,7 @@ mod windows {
+     impl InstalledApp for App {
+         fn zed_version_string(&self) -> String {
+             format!(
+-                "Zed {}{}{} – {}",
++                "ZEDP-RTL {}{}{} – {}",
+                 if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
+                     "".to_string()
+                 } else {
+@@ -1235,9 +1235,7 @@ mod windows {
+                 let cli = std::env::current_exe()?;
+                 let dir = cli.parent().context("no parent path for cli")?;
+ 
+-                // ../Zed.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
+-                // directory in development builds.
+-                let possible_locations = ["../Zed.exe", "../lib/zed/zed-editor.exe", "./zed.exe"];
++                let possible_locations = ["../ZEDP-RTL.exe", "./zedp-rtl.exe"];
+                 possible_locations
+                     .iter()
+                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
+diff --git a/crates/editor/src/element.rs b/crates/editor/src/element.rs
+index afc15a1..78e84e8 100644
+--- a/crates/editor/src/element.rs
++++ b/crates/editor/src/element.rs
+@@ -6604,6 +6604,54 @@ impl EditorElement {
+                     ..cmp::min(range.end.row().next_row(), end_row)
+             };
+ 
++            // One logical selection may occupy disjoint visual intervals on a bidi row.
++            if row_range.iter_rows().any(|row| {
++                layout.position_map.line_layouts[row.minus(start_row) as usize].has_rtl()
++            }) {
++                for row in row_range.iter_rows() {
++                    let line = &layout.position_map.line_layouts[row.minus(start_row) as usize];
++                    let from = if row == range.start.row() {
++                        range.start.column() as usize
++                    } else {
++                        0
++                    };
++                    let to = if row == range.end.row() {
++                        range.end.column() as usize
++                    } else {
++                        line.len
++                    };
++                    let mut spans = line.visual_selection(from..to);
++                    if row != range.end.row() && line_end_overshoot > Pixels::ZERO {
++                        spans.push(line.width..line.width + line_end_overshoot);
++                    }
++                    let origin_x = layout.content_origin.x
++                        + line.alignment_offset(layout.text_align, layout.content_width)
++                        - Pixels::from(layout.position_map.scroll_pixel_position.x);
++                    let start_y = layout.content_origin.y
++                        + Pixels::from(
++                            (row.as_f64() - layout.position_map.scroll_position.y)
++                                * ScrollOffset::from(layout.position_map.line_height),
++                        );
++                    for span in spans {
++                        HighlightedRange {
++                            lines: vec![HighlightedRangeLine {
++                                start_x: origin_x + span.start,
++                                end_x: origin_x + span.end,
++                            }],
++                            color,
++                            corner_radius,
++                            line_height: layout.position_map.line_height,
++                            start_y,
++                        }
++                        .paint(
++                            fill,
++                            layout.position_map.text_hitbox.bounds,
++                            window,
++                        );
++                    }
++                }
++                return;
++            }
+             let highlighted_range = HighlightedRange {
+                 color,
+                 line_height: layout.position_map.line_height,
+@@ -8257,6 +8305,37 @@ impl LineWithInvisibles {
+         }
+     }
+ 
++    fn has_rtl(&self) -> bool {
++        self.fragments.iter().any(|fragment| matches!(fragment, LineFragment::Text(line) if line.runs.iter().any(|run| run.is_rtl)))
++    }
++
++    fn visual_selection(&self, bytes: Range<usize>) -> Vec<Range<Pixels>> {
++        let mut spans = Vec::new();
++        let mut byte = 0;
++        let mut x = Pixels::ZERO;
++        for fragment in &self.fragments {
++            let (len, width) = match fragment {
++                LineFragment::Text(line) => (line.len, line.width),
++                LineFragment::Element { len, size, .. } => (*len, size.width),
++            };
++            let start = bytes.start.saturating_sub(byte).min(len);
++            let end = bytes.end.saturating_sub(byte).min(len);
++            if start < end {
++                match fragment {
++                    LineFragment::Text(line) => spans.extend(
++                        line.visual_ranges_for_bytes(start..end)
++                            .into_iter()
++                            .map(|s| x + s.start..x + s.end),
++                    ),
++                    LineFragment::Element { .. } => spans.push(x..x + width),
++                }
++            }
++            byte += len;
++            x += width;
++        }
++        spans
++    }
++
+     pub fn x_for_index(&self, index: usize) -> Pixels {
+         let mut fragment_start_x = Pixels::ZERO;
+         let mut fragment_start_index = 0;
+@@ -8265,7 +8344,9 @@ impl LineWithInvisibles {
+             match fragment {
+                 LineFragment::Text(shaped_line) => {
+                     let fragment_end_index = fragment_start_index + shaped_line.len;
+-                    if index < fragment_end_index {
++                    if index < fragment_end_index
++                        || (index == self.len && index == fragment_end_index)
++                    {
+                         return fragment_start_x
+                             + shaped_line.x_for_index(index - fragment_start_index);
+                     }
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 86520ab..a663863 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1731,6 +1731,7 @@ impl PlatformTextSystem for NoopTextSystem {
+             runs.push(ShapedRun {
+                 font_id: FontId(0),
+                 glyphs,
++                is_rtl: false,
+             });
+         } else {
+             position = px(0.);
+diff --git a/crates/gpui/src/text_system/line.rs b/crates/gpui/src/text_system/line.rs
+index e0eb71f..978e87c 100644
+--- a/crates/gpui/src/text_system/line.rs
++++ b/crates/gpui/src/text_system/line.rs
+@@ -65,7 +65,8 @@ impl ShapedLine {
+             .is_sorted();
+         ShapedLineCursor {
+             line: self,
+-            unordered_remainder: (!byte_ordered).then(|| self.clone()),
++            unordered_remainder: (!byte_ordered || self.runs.iter().any(|run| run.is_rtl))
++                .then(|| self.clone()),
+             byte_index: 0,
+             run_index: 0,
+             glyph_index: 0,
+@@ -327,6 +328,7 @@ impl<'a> ShapedLineCursor<'a> {
+                             is_emoji: glyph.is_emoji,
+                         })
+                         .collect(),
++                    is_rtl: run.is_rtl,
+                 });
+             }
+             if let Some(glyph) = run.glyphs.get(self.glyph_index) {
+@@ -998,6 +1000,7 @@ mod tests {
+                 runs: vec![ShapedRun {
+                     font_id: FontId(0),
+                     glyphs: shaped_glyphs,
++                    is_rtl: false,
+                 }],
+                 len: text.len(),
+             }),
+@@ -1402,6 +1405,7 @@ mod tests {
+                                 is_emoji: false,
+                             },
+                         ],
++                        is_rtl: false,
+                     },
+                     ShapedRun {
+                         font_id: FontId(1),
+@@ -1425,6 +1429,7 @@ mod tests {
+                                 is_emoji: false,
+                             },
+                         ],
++                        is_rtl: false,
+                     },
+                 ],
+                 len: 6,
+@@ -1648,6 +1653,7 @@ mod tests {
+                                 is_emoji: false,
+                             },
+                         ],
++                        is_rtl: false,
+                     },
+                     ShapedRun {
+                         font_id: FontId(8),
+@@ -1665,6 +1671,7 @@ mod tests {
+                                 is_emoji: false,
+                             },
+                         ],
++                        is_rtl: false,
+                     },
+                 ],
+                 len: 10,
+diff --git a/crates/gpui/src/text_system/line_layout.rs b/crates/gpui/src/text_system/line_layout.rs
+index 0686a70..071320c 100644
+--- a/crates/gpui/src/text_system/line_layout.rs
++++ b/crates/gpui/src/text_system/line_layout.rs
+@@ -37,8 +37,14 @@ pub struct LineLayout {
+ pub struct ShapedRun {
+     /// The font id for this run
+     pub font_id: FontId,
+-    /// The glyphs that make up this run
++    /// Glyphs in paint order; for RTL runs this is visual order.
+     pub glyphs: Vec<ShapedGlyph>,
++    /// Run direction, from the shaper's bidi level. The Windows shaper sets it
++    /// from DirectWrite's `bidiLevel`; every other shaper sets it false.
++    /// Storing it matters for a single-glyph RTL run (one Persian letter amid
++    /// English text), which has no descending index to infer the direction
++    /// from.
++    pub is_rtl: bool,
+ }
+ 
+ /// A single glyph, ready to paint.
+@@ -57,41 +63,194 @@ pub struct ShapedGlyph {
+     pub is_emoji: bool,
+ }
+ 
++/// One caret position: the x for a utf-8 character boundary.
++///
++/// Runs arrive from the shaper in visual order, so an RTL run's glyphs are
++/// stored right-to-left even though its source indices run the other way.
++/// That is why the caret math below cannot assume x rises with the byte index.
++#[derive(Clone, Copy)]
++struct CaretStop {
++    index: usize,
++    x: Pixels,
++    is_rtl: bool,
++}
++
+ impl LineLayout {
++    /// Caret x for every character boundary, ascending by byte index.
++    /// RTL runs read right to left: a glyph's left edge is the caret *after*
++    /// its character, and the run's first character starts at its right edge.
++    fn caret_stops(&self) -> Vec<CaretStop> {
++        // Run starts; each run ends where the next begins (runs tile [0, len)).
++        let run_starts: Vec<usize> = self
++            .runs
++            .iter()
++            .map(|r| r.glyphs.iter().map(|g| g.index).min().unwrap_or(0))
++            .collect();
++
++        let mut stops: Vec<CaretStop> = Vec::new();
++        for (run_ix, run) in self.runs.iter().enumerate() {
++            if run.glyphs.is_empty() {
++                continue;
++            }
++            let min_ix = run_starts[run_ix];
++            let max_ix = run.glyphs.iter().map(|g| g.index).max().unwrap_or(0);
++            let run_end = run_starts
++                .iter()
++                .copied()
++                .filter(|start| *start > max_ix)
++                .min()
++                .unwrap_or(self.len);
++            // Right edge: the next run's left edge, else the line width.
++            let run_right_x = self
++                .runs
++                .get(run_ix + 1)
++                .and_then(|next| next.glyphs.iter().map(|g| g.position.x).min())
++                .unwrap_or(self.width);
++            // Visual left edge of this run.
++            let run_left_x = run
++                .glyphs
++                .iter()
++                .map(|g| g.position.x)
++                .min()
++                .unwrap_or(px(0.));
++
++            // Glyphs sharing a source index (base + combining marks, or a
++            // ligature) are one caret cell: the caret never stops inside it.
++            let mut clusters: Vec<CaretStop> = Vec::new();
++            for glyph in &run.glyphs {
++                if let Some(last) = clusters.last_mut() {
++                    if last.index == glyph.index {
++                        if glyph.position.x < last.x {
++                            last.x = glyph.position.x;
++                        }
++                        continue;
++                    }
++                }
++                clusters.push(CaretStop {
++                    index: glyph.index,
++                    x: glyph.position.x,
++                    is_rtl: run.is_rtl,
++                });
++            }
++            // Clusters in ascending source-index order.
++            clusters.sort_by_key(|cluster| cluster.index);
++
++            if run.is_rtl {
++                // Caret before the run's first character: right edge if the
++                // run opens the line, else the left edge.
++                let before_x = if run_ix > 0 { run_left_x } else { run_right_x };
++                stops.push(CaretStop {
++                    index: min_ix,
++                    x: before_x,
++                    is_rtl: true,
++                });
++                for k in 0..clusters.len() {
++                    // Caret after this character: the cluster's left edge;
++                    // index is the next character's start (or the run end).
++                    let after = if k + 1 < clusters.len() {
++                        clusters[k + 1].index
++                    } else {
++                        run_end
++                    };
++                    // Last character: right edge when another run follows,
++                    // else the left edge.
++                    let after_x = if k + 1 < clusters.len() {
++                        clusters[k].x
++                    } else if run_ix + 1 < self.runs.len() {
++                        run_right_x
++                    } else {
++                        clusters[k].x
++                    };
++                    stops.push(CaretStop {
++                        index: after,
++                        x: after_x,
++                        is_rtl: true,
++                    });
++                }
++            } else {
++                for cluster in &clusters {
++                    stops.push(CaretStop {
++                        index: cluster.index,
++                        x: cluster.x,
++                        is_rtl: false,
++                    });
++                }
++                // Caret after the run's last character.
++                stops.push(CaretStop {
++                    index: run_end,
++                    x: run_right_x,
++                    is_rtl: false,
++                });
++            }
++        }
++        stops.sort_by_key(|stop| (stop.index, stop.is_rtl));
++        stops
++    }
++
+     /// The index for the character at the given x coordinate
+     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
+         if x >= self.width {
+             None
+         } else {
+-            for run in self.runs.iter().rev() {
+-                for glyph in run.glyphs.iter().rev() {
+-                    if glyph.position.x <= x {
+-                        return Some(glyph.index);
++            // No RTL runs: glyphs are in logical order, so the scan works.
++            if self.runs.iter().all(|r| !r.is_rtl) {
++                for run in self.runs.iter().rev() {
++                    for glyph in run.glyphs.iter().rev() {
++                        if glyph.position.x <= x {
++                            return Some(glyph.index);
++                        }
++                    }
++                }
++                return Some(0);
++            }
++            // RTL: the rightmost stop at or left of the click point wins.
++            let mut best: Option<(Pixels, usize)> = None;
++            for stop in self.caret_stops() {
++                if stop.x <= x {
++                    match best {
++                        Some((best_x, _)) if stop.x < best_x => {}
++                        _ => best = Some((stop.x, stop.index)),
+                     }
+                 }
+             }
+-            Some(0)
++            best.map(|(_, index)| index).or(Some(0))
+         }
+     }
+ 
+     /// closest_index_for_x returns the character boundary closest to the given x coordinate
+     /// (e.g. to handle aligning up/down arrow keys)
+     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
+-        let mut prev_index = 0;
+-        let mut prev_x = px(0.);
+-
+-        for run in self.runs.iter() {
+-            for glyph in run.glyphs.iter() {
+-                if glyph.position.x >= x {
+-                    if glyph.position.x - x < x - prev_x {
+-                        return glyph.index;
+-                    } else {
+-                        return prev_index;
++        // No RTL runs: glyphs are in x order.
++        if self.runs.iter().all(|r| !r.is_rtl) {
++            let mut prev_index = 0;
++            let mut prev_x = px(0.);
++            for run in &self.runs {
++                for glyph in &run.glyphs {
++                    if glyph.position.x >= x {
++                        if glyph.position.x - x < x - prev_x {
++                            return glyph.index;
++                        } else {
++                            return prev_index;
++                        }
+                     }
++                    prev_index = glyph.index;
++                    prev_x = glyph.position.x;
++                }
++            }
++        } else {
++            // RTL: nearest stop, ties broken toward the smaller x.
++            let mut best_index = 0;
++            let mut best_dist = f32::INFINITY;
++            let mut best_x = px(f32::INFINITY);
++            for stop in self.caret_stops() {
++                let dist = f32::from(stop.x - x).abs();
++                if dist < best_dist || (dist == best_dist && stop.x < best_x) {
++                    best_dist = dist;
++                    best_index = stop.index;
++                    best_x = stop.x;
+                 }
+-                prev_index = glyph.index;
+-                prev_x = glyph.position.x;
+             }
++            return best_index;
+         }
+ 
+         if self.len == 1 {
+@@ -107,24 +266,59 @@ impl LineLayout {
+ 
+     /// The x position of the character at the given index
+     pub fn x_for_index(&self, index: usize) -> Pixels {
+-        for run in &self.runs {
+-            for glyph in &run.glyphs {
+-                if glyph.index >= index {
+-                    return glyph.position.x;
++        // No RTL runs: first glyph with index >= target.
++        if self.runs.iter().all(|r| !r.is_rtl) {
++            for run in &self.runs {
++                for glyph in &run.glyphs {
++                    if glyph.index >= index {
++                        return glyph.position.x;
++                    }
+                 }
+             }
++            return self.width;
++        }
++        // RTL: first stop at or after the index.
++        for stop in self.caret_stops() {
++            if stop.index >= index {
++                return stop.x;
++            }
+         }
+         self.width
+     }
+ 
+     /// The corresponding Font at the given index
+     pub fn font_id_for_index(&self, index: usize) -> Option<FontId> {
+-        for run in &self.runs {
+-            for glyph in &run.glyphs {
+-                if glyph.index >= index {
+-                    return Some(run.font_id);
++        if self.runs.iter().all(|r| !r.is_rtl) {
++            for run in &self.runs {
++                for glyph in &run.glyphs {
++                    if glyph.index >= index {
++                        return Some(run.font_id);
++                    }
+                 }
+             }
++            return None;
++        }
++        // RTL: find the run containing the index.
++        let run_starts: Vec<usize> = self
++            .runs
++            .iter()
++            .map(|r| r.glyphs.iter().map(|g| g.index).min().unwrap_or(0))
++            .collect();
++        for (run_ix, run) in self.runs.iter().enumerate() {
++            if run.glyphs.is_empty() {
++                continue;
++            }
++            let min_ix = run_starts[run_ix];
++            let max_ix = run.glyphs.iter().map(|g| g.index).max().unwrap_or(0);
++            let run_end = run_starts
++                .iter()
++                .copied()
++                .filter(|start| *start > max_ix)
++                .min()
++                .unwrap_or(self.len);
++            if min_ix <= index && index < run_end {
++                return Some(run.font_id);
++            }
+         }
+         None
+     }
+@@ -137,6 +331,43 @@ impl LineLayout {
+     ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
+     /// - `font_size`, `ascent`, and `descent` are copied to both halves.
+     pub fn split_at(&self, byte_index: usize) -> (LineLayout, LineLayout) {
++        if self.runs.iter().any(|run| run.is_rtl) {
++            let mut pieces = [LineLayout::default(), LineLayout::default()];
++            for piece in &mut pieces {
++                piece.font_size = self.font_size;
++                piece.ascent = self.ascent;
++                piece.descent = self.descent;
++            }
++            for (run, cluster, cell) in self.visual_clusters() {
++                let suffix = cluster[0].index >= byte_index;
++                let piece = &mut pieces[usize::from(suffix)];
++                if piece
++                    .runs
++                    .last()
++                    .is_none_or(|last| last.font_id != run.font_id || last.is_rtl != run.is_rtl)
++                {
++                    piece.runs.push(ShapedRun {
++                        font_id: run.font_id,
++                        is_rtl: run.is_rtl,
++                        glyphs: Vec::new(),
++                    });
++                }
++                if let Some(last) = piece.runs.last_mut() {
++                    for mut glyph in cluster.iter().cloned() {
++                        glyph.position.x += piece.width - cell.start;
++                        if suffix {
++                            glyph.index -= byte_index;
++                        }
++                        last.glyphs.push(glyph);
++                    }
++                }
++                piece.width += cell.end - cell.start;
++            }
++            let [mut left, mut right] = pieces;
++            left.len = byte_index;
++            right.len = self.len - byte_index;
++            return (left, right);
++        }
+         let x_offset = self.x_for_index(byte_index);
+ 
+         // Partition glyph runs. A single run may contribute glyphs to both halves.
+@@ -150,6 +381,7 @@ impl LineLayout {
+                 left_runs.push(ShapedRun {
+                     font_id: run.font_id,
+                     glyphs: run.glyphs[..split_pos].to_vec(),
++                    is_rtl: run.is_rtl,
+                 });
+             }
+ 
+@@ -166,6 +398,7 @@ impl LineLayout {
+                 right_runs.push(ShapedRun {
+                     font_id: run.font_id,
+                     glyphs: right_glyphs,
++                    is_rtl: run.is_rtl,
+                 });
+             }
+         }
+@@ -191,6 +424,60 @@ impl LineLayout {
+         (left, right)
+     }
+ 
++    fn visual_clusters(&self) -> impl Iterator<Item = (&ShapedRun, &[ShapedGlyph], Range<Pixels>)> {
++        let mut clusters = self
++            .runs
++            .iter()
++            .flat_map(|run| {
++                run.glyphs
++                    .chunk_by(|a, b| a.index == b.index)
++                    .map(move |glyphs| (run, glyphs))
++            })
++            .peekable();
++        let mut left = Pixels::ZERO;
++        std::iter::from_fn(move || {
++            let (run, glyphs) = clusters.next()?;
++            let right = clusters
++                .peek()
++                .map_or(self.width, |(_, next)| next[0].position.x)
++                .max(left)
++                .min(self.width);
++            let cell = left..right;
++            left = right;
++            Some((run, glyphs, cell))
++        })
++    }
++
++    /// Visual intervals occupied by the selected source clusters in a bidirectional line.
++    pub fn visual_ranges_for_bytes(&self, bytes: Range<usize>) -> Vec<Range<Pixels>> {
++        let mut ranges: Vec<Range<Pixels>> = Vec::new();
++        if bytes.is_empty() || bytes.start >= self.len {
++            return ranges;
++        }
++        // A ligature or combining cluster may start before the selected byte.
++        let first = self
++            .runs
++            .iter()
++            .flat_map(|run| &run.glyphs)
++            .map(|g| g.index)
++            .filter(|index| *index <= bytes.start)
++            .max()
++            .unwrap_or(bytes.start);
++        for (_, glyphs, cell) in self.visual_clusters() {
++            if !(first..bytes.end).contains(&glyphs[0].index) || cell.is_empty() {
++                continue;
++            }
++            if let Some(last) = ranges.last_mut()
++                && last.end == cell.start
++            {
++                last.end = cell.end;
++            } else {
++                ranges.push(cell);
++            }
++        }
++        ranges
++    }
++
+     fn compute_wrap_boundaries(
+         &self,
+         text: &str,
+@@ -896,6 +1183,7 @@ mod tests {
+             runs: vec![ShapedRun {
+                 font_id: FontId(0),
+                 glyphs,
++                is_rtl: false,
+             }],
+             len: 0,
+         }
+@@ -990,6 +1278,242 @@ mod tests {
+         );
+     }
+ 
++    fn make_run(font_ix: usize, glyphs: Vec<ShapedGlyph>) -> ShapedRun {
++        ShapedRun {
++            font_id: FontId(font_ix),
++            glyphs,
++            is_rtl: false,
++        }
++    }
++
++    fn make_rtl_run(font_ix: usize, glyphs: Vec<ShapedGlyph>) -> ShapedRun {
++        ShapedRun {
++            font_id: FontId(font_ix),
++            glyphs,
++            is_rtl: true,
++        }
++    }
++
++    fn make_layout_runs(runs: Vec<ShapedRun>, width: f32, len: usize) -> LineLayout {
++        LineLayout {
++            font_size: px(16.),
++            width: px(width),
++            ascent: px(12.),
++            descent: px(4.),
++            runs,
++            len,
++        }
++    }
++
++    #[test]
++    fn test_caret_pure_ltr() {
++        // Four LTR glyphs, 10px each: caret x equals the glyph's left edge.
++        let layout = make_layout_runs(
++            vec![make_run(
++                0,
++                vec![
++                    glyph_at(0., 0),
++                    glyph_at(10., 1),
++                    glyph_at(20., 2),
++                    glyph_at(30., 3),
++                ],
++            )],
++            40.,
++            4,
++        );
++        assert_eq!(f32::from(layout.x_for_index(0)), 0.);
++        assert_eq!(f32::from(layout.x_for_index(2)), 20.);
++        assert_eq!(f32::from(layout.x_for_index(4)), 40.);
++        assert_eq!(layout.index_for_x(px(5.)), Some(0));
++        assert_eq!(layout.index_for_x(px(15.)), Some(1));
++        assert_eq!(layout.index_for_x(px(40.)), None);
++        assert_eq!(layout.closest_index_for_x(px(5.)), 0);
++        assert_eq!(layout.closest_index_for_x(px(14.)), 1);
++        assert_eq!(layout.closest_index_for_x(px(16.)), 2);
++    }
++
++    #[test]
++    fn test_caret_pure_rtl() {
++        // "سلام" (8 bytes, 10px glyphs, width 40), stored in visual order:
++        // م(6)@0, ا(4)@10, ل(2)@20, س(0)@30.
++        let layout = make_layout_runs(
++            vec![make_rtl_run(
++                0,
++                vec![
++                    glyph_at(0., 6),
++                    glyph_at(10., 4),
++                    glyph_at(20., 2),
++                    glyph_at(30., 0),
++                ],
++            )],
++            40.,
++            8,
++        );
++        // Caret at index 0 sits at the right edge, then at each glyph's left
++        // edge in descending-x order, ending at 0.
++        assert_eq!(f32::from(layout.x_for_index(0)), 40.);
++        assert_eq!(f32::from(layout.x_for_index(2)), 30.);
++        assert_eq!(f32::from(layout.x_for_index(4)), 20.);
++        assert_eq!(f32::from(layout.x_for_index(6)), 10.);
++        assert_eq!(f32::from(layout.x_for_index(8)), 0.);
++        // Clicking inside a glyph returns the caret just after it.
++        assert_eq!(layout.index_for_x(px(5.)), Some(8));
++        assert_eq!(layout.index_for_x(px(15.)), Some(6));
++        assert_eq!(layout.index_for_x(px(25.)), Some(4));
++        assert_eq!(layout.index_for_x(px(35.)), Some(2));
++        assert_eq!(layout.index_for_x(px(40.)), None);
++        // Goal-column resolution picks the nearest boundary.
++        assert_eq!(layout.closest_index_for_x(px(5.)), 8);
++        assert_eq!(layout.closest_index_for_x(px(14.)), 6);
++        assert_eq!(layout.closest_index_for_x(px(16.)), 4);
++        assert_eq!(layout.closest_index_for_x(px(39.)), 0);
++    }
++
++    #[test]
++    fn test_caret_ltr_then_rtl() {
++        // "abc سلام": LTR run [0,40), then RTL run [40,80); width 80.
++        let layout = make_layout_runs(
++            vec![
++                make_run(
++                    0,
++                    vec![
++                        glyph_at(0., 0),
++                        glyph_at(10., 1),
++                        glyph_at(20., 2),
++                        glyph_at(30., 3),
++                    ],
++                ),
++                make_rtl_run(
++                    0,
++                    vec![
++                        glyph_at(40., 10),
++                        glyph_at(50., 8),
++                        glyph_at(60., 6),
++                        glyph_at(70., 4),
++                    ],
++                ),
++            ],
++            80.,
++            12,
++        );
++        assert_eq!(f32::from(layout.x_for_index(0)), 0.);
++        assert_eq!(f32::from(layout.x_for_index(3)), 30.);
++        // Run boundary: the LTR run's right edge wins.
++        assert_eq!(f32::from(layout.x_for_index(4)), 40.);
++        assert_eq!(f32::from(layout.x_for_index(6)), 70.);
++        assert_eq!(f32::from(layout.x_for_index(8)), 60.);
++        assert_eq!(f32::from(layout.x_for_index(10)), 50.);
++        assert_eq!(f32::from(layout.x_for_index(12)), 40.);
++    }
++
++    #[test]
++    fn test_caret_rtl_then_ltr() {
++        // "سلام hello": RTL run [0,40), then LTR run [40,100); width 100.
++        let layout = make_layout_runs(
++            vec![
++                make_rtl_run(
++                    0,
++                    vec![
++                        glyph_at(0., 6),
++                        glyph_at(10., 4),
++                        glyph_at(20., 2),
++                        glyph_at(30., 0),
++                    ],
++                ),
++                make_run(
++                    0,
++                    vec![
++                        glyph_at(40., 8),
++                        glyph_at(50., 9),
++                        glyph_at(60., 10),
++                        glyph_at(70., 11),
++                        glyph_at(80., 12),
++                        glyph_at(90., 13),
++                    ],
++                ),
++            ],
++            100.,
++            14,
++        );
++        // Before the first character: the run's right edge.
++        assert_eq!(f32::from(layout.x_for_index(0)), 40.);
++        assert_eq!(f32::from(layout.x_for_index(2)), 30.);
++        assert_eq!(f32::from(layout.x_for_index(6)), 10.);
++        // Boundary at index 8: the LTR run's left edge wins the tie.
++        assert_eq!(f32::from(layout.x_for_index(8)), 40.);
++        assert_eq!(f32::from(layout.x_for_index(9)), 50.);
++        assert_eq!(f32::from(layout.x_for_index(14)), 100.);
++    }
++
++    #[test]
++    fn test_caret_single_glyph_rtl_run() {
++        // "aبb": a=0, ب=1 (2 bytes), b=3; visual order [a][ب][b]; width 30.
++        // A single-glyph RTL run needs is_rtl; it has no index descent to
++        // infer direction from.
++        let layout = make_layout_runs(
++            vec![
++                make_run(0, vec![glyph_at(0., 0)]),
++                make_rtl_run(0, vec![glyph_at(10., 1)]),
++                make_run(0, vec![glyph_at(20., 3)]),
++            ],
++            30.,
++            4,
++        );
++        // Boundaries fall on the Persian letter's edges, as in VS Code.
++        assert_eq!(f32::from(layout.x_for_index(0)), 0.);
++        assert_eq!(f32::from(layout.x_for_index(1)), 10.);
++        assert_eq!(f32::from(layout.x_for_index(3)), 20.);
++        assert_eq!(f32::from(layout.x_for_index(4)), 30.);
++        assert_eq!(layout.index_for_x(px(5.)), Some(0));
++        assert_eq!(layout.index_for_x(px(15.)), Some(1));
++        assert_eq!(layout.index_for_x(px(25.)), Some(3));
++        assert_eq!(layout.index_for_x(px(30.)), None);
++        assert_eq!(layout.closest_index_for_x(px(5.)), 0);
++        assert_eq!(layout.closest_index_for_x(px(15.)), 1);
++        assert_eq!(layout.closest_index_for_x(px(25.)), 3);
++    }
++
++    #[test]
++    fn test_caret_lone_rtl_character() {
++        // A lone Persian letter (2 bytes): caret before it at the right edge,
++        // after it at the left edge.
++        let layout = make_layout_runs(vec![make_rtl_run(0, vec![glyph_at(0., 0)])], 10., 2);
++        assert_eq!(f32::from(layout.x_for_index(0)), 10.);
++        assert_eq!(f32::from(layout.x_for_index(2)), 0.);
++        assert_eq!(layout.index_for_x(px(5.)), Some(2));
++        assert_eq!(layout.index_for_x(px(10.)), None);
++        assert_eq!(layout.closest_index_for_x(px(5.)), 2);
++    }
++
++    #[test]
++    fn test_caret_rtl_combining_mark() {
++        // "سَلام": the ا (index 4) plus its combining mark share source
++        // index 4, one cluster; the caret never stops between them.
++        let layout = make_layout_runs(
++            vec![make_rtl_run(
++                0,
++                vec![
++                    glyph_at(0., 6),  // م
++                    glyph_at(10., 4), // ا (base)
++                    glyph_at(12., 4), // َ combining mark, same cluster
++                    glyph_at(30., 2), // ل
++                    glyph_at(40., 0), // س
++                ],
++            )],
++            50.,
++            8,
++        );
++        assert_eq!(f32::from(layout.x_for_index(0)), 50.);
++        assert_eq!(f32::from(layout.x_for_index(2)), 40.);
++        assert_eq!(f32::from(layout.x_for_index(4)), 30.);
++        assert_eq!(f32::from(layout.x_for_index(6)), 10.);
++        assert_eq!(f32::from(layout.x_for_index(8)), 0.);
++        // Clicking inside the cluster resolves to its left-edge boundary.
++        assert_eq!(layout.index_for_x(px(11.)), Some(6));
++        assert_eq!(layout.index_for_x(px(15.)), Some(6));
++        assert_eq!(layout.closest_index_for_x(px(11.)), 6);
++    }
++
+     #[test]
+     fn test_force_width_latin_unchanged() {
+         let cell_width = px(8.);
+diff --git a/crates/gpui_apple/src/text_system.rs b/crates/gpui_apple/src/text_system.rs
+index 74cd7cc..e7b5425 100644
+--- a/crates/gpui_apple/src/text_system.rs
++++ b/crates/gpui_apple/src/text_system.rs
+@@ -607,6 +607,7 @@ impl AppleTextSystemState {
+                     runs.push(ShapedRun {
+                         font_id,
+                         glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
++                        is_rtl: false,
+                     });
+                     &mut runs.last_mut().unwrap().glyphs
+                 }
+diff --git a/crates/gpui_web/src/run_replacements.rs b/crates/gpui_web/src/run_replacements.rs
+index 2a190a2..3612edb 100644
+--- a/crates/gpui_web/src/run_replacements.rs
++++ b/crates/gpui_web/src/run_replacements.rs
+@@ -168,6 +168,7 @@ pub(crate) fn apply_replacements(layout: &mut LineLayout, replacements: Vec<Repl
+     layout.runs.resize_with(final_run_count, || ShapedRun {
+         font_id: FontId(0),
+         glyphs: Vec::new(),
++        is_rtl: false,
+     });
+ 
+     // Every destination is at or after its source. Expanding from the right
+@@ -192,6 +193,7 @@ pub(crate) fn apply_replacements(layout: &mut LineLayout, replacements: Vec<Repl
+                 layout.runs[destination_index] = ShapedRun {
+                     font_id: segment.font_id,
+                     glyphs,
++                    is_rtl: false,
+                 };
+                 glyph_end = glyph_start;
+             }
+@@ -376,6 +378,7 @@ mod tests {
+                 ShapedRun {
+                     font_id: FontId(font),
+                     glyphs,
++                    is_rtl: false,
+                 }
+             })
+             .collect();
+@@ -440,6 +443,7 @@ mod tests {
+                 layout.runs.push(ShapedRun {
+                     font_id,
+                     glyphs: vec![glyph],
++                    is_rtl: false,
+                 });
+             }
+         }
+diff --git a/crates/gpui_wgpu/src/cosmic_text_system.rs b/crates/gpui_wgpu/src/cosmic_text_system.rs
+index eafe974..a14a296 100644
+--- a/crates/gpui_wgpu/src/cosmic_text_system.rs
++++ b/crates/gpui_wgpu/src/cosmic_text_system.rs
+@@ -831,6 +831,7 @@ impl CosmicTextSystemState {
+             } else {
+                 runs.push(ShapedRun {
+                     font_id,
++                    is_rtl: false,
+                     glyphs: vec![shaped_glyph],
+                 });
+             }
+diff --git a/crates/gpui_windows/src/direct_write.rs b/crates/gpui_windows/src/direct_write.rs
+index 82ff963..4156422 100644
+--- a/crates/gpui_windows/src/direct_write.rs
++++ b/crates/gpui_windows/src/direct_write.rs
+@@ -462,6 +462,8 @@ impl DirectWriteState {
+                 }
+                 if let Some(last) = layout.runs.last_mut()
+                     && last.font_id == run.font_id
++                    && !last.is_rtl
++                    && !run.is_rtl
+                 {
+                     last.glyphs.append(&mut run.glyphs);
+                 } else {
+@@ -588,6 +590,12 @@ impl DirectWriteState {
+                 0.0,
+             )?;
+             let width = px(renderer_context.width);
++            if runs.iter().any(|(_, run)| run.is_rtl) {
++                // DirectWrite supplies visual baseline origins even when it calls the
++                // renderer in logical order. Preserve the native layout of nested runs.
++                runs.sort_by(|(left, _), (right, _)| left.total_cmp(right));
++            }
++            let runs = runs.into_iter().map(|(_, run)| run).collect();
+ 
+             Ok(LineLayout {
+                 font_size,
+@@ -1189,7 +1197,7 @@ struct RendererContext<'t, 'a, 'b> {
+     text_system: &'t mut DirectWriteState,
+     components: &'a DirectWriteComponents,
+     index_converter: StringIndexConverter<'a>,
+-    runs: &'b mut Vec<ShapedRun>,
++    runs: &'b mut Vec<(f32, ShapedRun)>,
+     layout: &'b IDWriteTextLayout,
+     width: f32,
+ }
+@@ -1290,7 +1298,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+     fn DrawGlyphRun(
+         &self,
+         clientdrawingcontext: *const ::core::ffi::c_void,
+-        _baselineoriginx: f32,
++        baseline_origin_x: f32,
+         _baselineoriginy: f32,
+         _measuringmode: DWRITE_MEASURING_MODE,
+         glyphrun: *const DWRITE_GLYPH_RUN,
+@@ -1299,6 +1307,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+     ) -> windows::core::Result<()> {
+         let glyphrun = unsafe { &*glyphrun };
+         let glyph_count = glyphrun.glyphCount as usize;
++        let is_rtl = glyphrun.bidiLevel & 1 != 0;
+         let desc = unsafe { &*glyphrundescription };
+         let text = match glyph_count {
+             0 => Some(unsafe {
+@@ -1329,10 +1338,10 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+             .font_info_cache
+             .get(&font_face_key)
+             .copied()
+-            // in some circumstances, we might be getting served a FontFace that we did not create ourselves
+-            // so create a new font from it and cache it accordingly. The usual culprit here seems to be Segoe UI Symbol
+             .map_or_else(
+                 || {
++                    // in some circumstances, we might be getting served a FontFace that we did not create ourselves
++                    // so create a new font from it and cache it accordingly. The usual culprit here seems to be Segoe UI Symbol
+                     let font = font_face_to_font(font_face, &self.locale)
+                         .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?;
+                     let font_id = match context.text_system.font_to_font_id.get(&font) {
+@@ -1379,14 +1388,29 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+                     .advance_to_utf16_ix(position as usize);
+                 glyphs.push(ShapedGlyph {
+                     id: GlyphId(u32::from(space)),
+-                    position: point(px(context.width), px(0.0)),
++                    position: point(px(metrics.left), px(0.0)),
+                     index: context.index_converter.utf8_ix,
+                     is_emoji: false,
+                 });
+                 context.width += metrics.width;
+             }
+             if !glyphs.is_empty() {
+-                context.runs.push(ShapedRun { font_id, glyphs });
++                let left = glyphs
++                    .iter()
++                    .map(|g| g.position.x.as_f32())
++                    .reduce(f32::min)
++                    .unwrap_or(baseline_origin_x);
++                if is_rtl {
++                    glyphs.sort_by_key(|g| std::cmp::Reverse(g.index));
++                }
++                context.runs.push((
++                    left,
++                    ShapedRun {
++                        font_id,
++                        glyphs,
++                        is_rtl,
++                    },
++                ));
+             }
+         } else {
+             let color_font = unsafe { font_face.IsColorFont().as_bool() };
+@@ -1423,6 +1447,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+             let cluster_analyzer = ClusterAnalyzer::new(cluster_map, glyph_count);
+             let mut utf16_idx = desc.textPosition as usize;
+             let mut glyph_idx = 0;
++            let mut pen = baseline_origin_x;
+             let mut glyphs = Vec::with_capacity(glyph_count);
+             for (cluster_utf16_len, cluster_glyph_count) in cluster_analyzer {
+                 context.index_converter.advance_to_utf16_ix(utf16_idx);
+@@ -1436,10 +1461,20 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+                     let is_emoji =
+                         color_font && is_color_glyph(font_face, id, &context.components.factory);
+                     let this_glyph_idx = glyph_idx + cluster_glyph_idx;
++                    let advance = glyph_advances[this_glyph_idx];
++                    let offset = glyph_offsets[this_glyph_idx].advanceOffset;
++                    let glyph_x = if is_rtl {
++                        pen -= advance;
++                        pen - offset
++                    } else {
++                        let x = pen + offset;
++                        pen += advance;
++                        x
++                    };
+                     glyphs.push(ShapedGlyph {
+                         id,
+                         position: point(
+-                            px(context.width + glyph_offsets[this_glyph_idx].advanceOffset),
++                            px(glyph_x),
+                             px(-glyph_offsets[this_glyph_idx].ascenderOffset),
+                         ),
+                         index: context.index_converter.utf8_ix,
+@@ -1449,7 +1484,17 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+                 }
+                 glyph_idx += cluster_glyph_count;
+             }
+-            context.runs.push(ShapedRun { font_id, glyphs });
++            if is_rtl {
++                glyphs.sort_by_key(|g| std::cmp::Reverse(g.index));
++            }
++            context.runs.push((
++                pen.min(baseline_origin_x),
++                ShapedRun {
++                    font_id,
++                    glyphs,
++                    is_rtl,
++                },
++            ));
+         }
+         Ok(())
+     }
+@@ -1550,6 +1595,10 @@ impl<'a> StringIndexConverter<'a> {
+     }
+ 
+     fn advance_to_utf16_ix(&mut self, utf16_target: usize) {
++        if utf16_target < self.utf16_ix {
++            self.utf8_ix = 0;
++            self.utf16_ix = 0;
++        }
+         for (ix, c) in self.text[self.utf8_ix..].char_indices() {
+             if self.utf16_ix >= utf16_target {
+                 self.utf8_ix += ix;
+@@ -1897,17 +1946,29 @@ mod tests {
+                                         )
+                                         .width
+                             };
+-                            assert!(
+-                                (shaped.x_for_index(index) - expected_x).abs() < px(0.001),
+-                                "{family}, {font_size:?}, {text:?}, {split_runs}, index={index}: \
++                            if shaped.runs.iter().all(|run| !run.is_rtl) {
++                                assert!(
++                                    (shaped.x_for_index(index) - expected_x).abs() < px(0.001),
++                                    "{family}, {font_size:?}, {text:?}, {split_runs}, index={index}: \
+                                  expected {expected_x:?}, got {:?}",
+-                                shaped.x_for_index(index)
+-                            );
+-                            assert_eq!(
+-                                shaped.index_for_x(expected_x + px(0.01)),
+-                                Some(index),
+-                                "{family}, {text:?}, index={index}"
+-                            );
++                                    shaped.x_for_index(index)
++                                );
++                                assert_eq!(
++                                    shaped.index_for_x(expected_x + px(0.01)),
++                                    Some(index),
++                                    "{family}, {text:?}, index={index}"
++                                );
++                            } else {
++                                let selected_width = shaped
++                                    .visual_ranges_for_bytes(index..end)
++                                    .iter()
++                                    .fold(px(0.0), |sum, span| sum + (span.end - span.start));
++                                assert!(
++                                    (selected_width - (expected_end - expected_x)).abs()
++                                        < px(0.001),
++                                    "{family}, {text:?}, index={index}, selected width {selected_width:?}"
++                                );
++                            }
+                             let piece = cursor.take_until(end);
+                             assert_eq!(piece.text.as_ref(), character.to_string());
+                             assert!(
+@@ -1922,7 +1983,9 @@ mod tests {
+                                 .abs()
+                                 < px(0.001)
+                         );
+-                        assert_eq!(shaped.x_for_index(text.len()), shaped.width);
++                        if shaped.runs.iter().all(|run| !run.is_rtl) {
++                            assert_eq!(shaped.x_for_index(text.len()), shaped.width);
++                        }
+                     }
+                 }
+             }
+@@ -1930,6 +1993,82 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn persian_selection_and_caret_follow_directwrite() -> Result<()> {
++        use windows::Win32::Graphics::DirectWrite::DWRITE_HIT_TEST_METRICS;
++        let platform = Arc::new(DirectWriteTextSystem::new()?);
++        let system = WindowTextSystem::new(Arc::new(TextSystem::new(platform.clone())));
++        let font = Font {
++            family: "Segoe UI".into(),
++            ..Default::default()
++        };
++        let font_id = platform.font_id(&font)?;
++        let format = {
++            let state = platform.state.read();
++            let info = &state.fonts[font_id.0];
++            unsafe {
++                platform.components.factory.CreateTextFormat(
++                    &info.font_family_h,
++                    &info.font_collection,
++                    info.font_face.GetWeight(),
++                    info.font_face.GetStyle(),
++                    DWRITE_FONT_STRETCH_NORMAL,
++                    16.0,
++                    &platform.components.locale,
++                )?
++            }
++        };
++        for text in ["بپژ", "x (بپژ 12) z", "a\tبپژ\tb", "پژ س ۱۲"] {
++            let utf16 = text.encode_utf16().collect::<Vec<_>>();
++            let native = unsafe {
++                platform.components.factory.CreateTextLayout(
++                    &utf16,
++                    &format,
++                    f32::INFINITY,
++                    f32::INFINITY,
++                )?
++            };
++            let shaped = system.shape_line(
++                text.into(),
++                px(16.0),
++                &[TextRun {
++                    len: text.len(),
++                    font: font.clone(),
++                    ..Default::default()
++                }],
++                None,
++            );
++            assert!(shaped.runs.iter().any(|run| run.is_rtl));
++            let mut offset = 0;
++            for (byte, ch) in text.char_indices() {
++                let mut hit = DWRITE_HIT_TEST_METRICS::default();
++                let (mut x, mut y) = (0., 0.);
++                unsafe {
++                    native.HitTestTextPosition(offset, false, &mut x, &mut y, &mut hit)?;
++                }
++                let spans = shaped.visual_ranges_for_bytes(byte..byte + ch.len_utf8());
++                assert_eq!(spans.len(), 1, "{text:?} byte {byte}");
++                assert!(
++                    (spans[0].start - px(hit.left)).abs() < px(0.05),
++                    "{text:?} {ch} left {:?} != {}",
++                    spans[0].start,
++                    hit.left
++                );
++                assert!(
++                    (spans[0].end - px(hit.left + hit.width)).abs() < px(0.05),
++                    "{text:?} {ch} right"
++                );
++                // Inside a Persian run, both shaping engines must put the caret on its right edge.
++                if ch == 'پ' && byte > 0 && text[..byte].ends_with('ب') {
++                    assert!((shaped.x_for_index(byte) - px(x)).abs() < px(0.05));
++                    assert_eq!(shaped.closest_index_for_x(px(x - 0.01)), byte);
++                }
++                offset += ch.len_utf16() as u32;
++            }
++        }
++        Ok(())
++    }
++
+     #[test]
+     fn unicode_line_separators_preserve_shaped_line_cursor() -> Result<()> {
+         check_unicode_separator_cursor('\u{2028}')
+diff --git a/crates/paths/src/paths.rs b/crates/paths/src/paths.rs
+index 9c16f1d..8183376 100644
+--- a/crates/paths/src/paths.rs
++++ b/crates/paths/src/paths.rs
+@@ -15,7 +15,7 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
+ /// and state directory paths.
+ ///
+ /// Forks should change this to avoid colliding with Zed's user data.
+-pub const APP_NAME: &str = "Zed";
++pub const APP_NAME: &str = "ZEDP-RTL";
+ 
+ /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
+ /// Linux/FreeBSD and the macOS `~/.config` fallback.
+diff --git a/crates/release_channel/src/lib.rs b/crates/release_channel/src/lib.rs
+index c79ca14..9db798b 100644
+--- a/crates/release_channel/src/lib.rs
++++ b/crates/release_channel/src/lib.rs
+@@ -44,10 +44,10 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
+ #[cfg(target_os = "windows")]
+ pub fn app_identifier() -> &'static str {
+     match *RELEASE_CHANNEL {
+-        ReleaseChannel::Dev => "Zed-Editor-Dev",
+-        ReleaseChannel::Nightly => "Zed-Editor-Nightly",
+-        ReleaseChannel::Preview => "Zed-Editor-Preview",
+-        ReleaseChannel::Stable => "Zed-Editor-Stable",
++        ReleaseChannel::Dev => "ZEDP-RTL-Dev",
++        ReleaseChannel::Nightly => "ZEDP-RTL-Nightly",
++        ReleaseChannel::Preview => "ZEDP-RTL-Preview",
++        ReleaseChannel::Stable => "ZEDP-RTL-Stable",
+     }
+ }
+ 
+@@ -208,7 +208,7 @@ impl ReleaseChannel {
+             ReleaseChannel::Dev => "Zed Dev",
+             ReleaseChannel::Nightly => "Zed Nightly",
+             ReleaseChannel::Preview => "Zed Preview",
+-            ReleaseChannel::Stable => "Zed",
++            ReleaseChannel::Stable => "ZEDP-RTL",
+         }
+     }
+ 
+diff --git a/crates/title_bar/src/title_bar.rs b/crates/title_bar/src/title_bar.rs
+index ba50023..9510dc4 100644
+--- a/crates/title_bar/src/title_bar.rs
++++ b/crates/title_bar/src/title_bar.rs
+@@ -1180,7 +1180,8 @@ impl TitleBar {
+                     Some(AutoUpdateStatus::Installing { .. })
+                     | Some(AutoUpdateStatus::Downloading { .. })
+                     | Some(AutoUpdateStatus::Checking) => "Updating...",
+-                    Some(AutoUpdateStatus::Idle)
++                    Some(AutoUpdateStatus::CommunityRelease { .. })
++                    | Some(AutoUpdateStatus::Idle)
+                     | Some(AutoUpdateStatus::Errored { .. })
+                     | None => "Please update Zed to Collaborate",
+                 };
+diff --git a/crates/title_bar/src/update_version.rs b/crates/title_bar/src/update_version.rs
+index b5164b2..62a2171 100644
+--- a/crates/title_bar/src/update_version.rs
++++ b/crates/title_bar/src/update_version.rs
+@@ -74,7 +74,9 @@ impl UpdateVersion {
+ 
+     pub fn update_simulation(&mut self, cx: &mut Context<Self>) {
+         let next_state = match self.status {
+-            AutoUpdateStatus::Idle => AutoUpdateStatus::Checking,
++            AutoUpdateStatus::Idle | AutoUpdateStatus::CommunityRelease { .. } => {
++                AutoUpdateStatus::Checking
++            }
+             AutoUpdateStatus::Checking => AutoUpdateStatus::Downloading {
+                 version: Version::new(1, 99, 0),
+                 progress: Some(0.5),
+@@ -131,6 +133,12 @@ impl Render for UpdateVersion {
+             return UpdateButton::up_to_date().into_any_element();
+         }
+         match &self.status {
++            AutoUpdateStatus::CommunityRelease { version, url } => {
++                let url = url.clone();
++                Button::new("zedp-rtl-release", format!("Update ZEDP-RTL to {version}"))
++                    .on_click(move |_, _, cx| cx.open_url(&url))
++                    .into_any_element()
++            }
+             AutoUpdateStatus::Checking if self.update_check_type.is_manual() => {
+                 UpdateButton::checking().into_any_element()
+             }
+diff --git a/crates/windows_resources/src/windows_resources.rs b/crates/windows_resources/src/windows_resources.rs
+index 3cc5e5e..af2db0f 100644
+--- a/crates/windows_resources/src/windows_resources.rs
++++ b/crates/windows_resources/src/windows_resources.rs
+@@ -44,7 +44,7 @@ const MANIFEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/mani
+ pub fn compile(manifest: bool) -> Result<(), Box<dyn std::error::Error>> {
+     let channel = option_env!("RELEASE_CHANNEL").unwrap_or("dev");
+     let (icon_filename, product_name) = match channel {
+-        "stable" => ("app-icon.ico", "Zed"),
++        "stable" => ("app-icon.ico", "ZEDP-RTL"),
+         "preview" => ("app-icon-preview.ico", "Zed Preview"),
+         "nightly" => ("app-icon-nightly.ico", "Zed Nightly"),
+         _ => ("app-icon-dev.ico", "Zed Dev"),
+@@ -100,7 +100,7 @@ BEGIN
+             VALUE "FileVersion", "{pkg_version}\0"
+             VALUE "ProductName", "{product_name}\0"
+             VALUE "ProductVersion", "{product_version}\0"
+-            VALUE "CompanyName", "Zed Industries, Inc.\0"
++            VALUE "CompanyName", "ZEDP-RTL contributors\0"
+             VALUE "LegalCopyright", "Copyright 2022 - 2025 Zed Industries, Inc.\0"
+         END
+     END
+diff --git a/crates/zed/Cargo.toml b/crates/zed/Cargo.toml
+index 47648fc..0b1c9ae 100644
+--- a/crates/zed/Cargo.toml
++++ b/crates/zed/Cargo.toml
+@@ -6,7 +6,7 @@ version = "1.30.2"
+ publish.workspace = true
+ license = "GPL-3.0-or-later"
+ authors = ["Zed Team <hi@zed.dev>"]
+-default-run = "zed"
++default-run = "zedp-rtl"
+ 
+ [lints]
+ workspace = true
+@@ -55,7 +55,7 @@ visual-tests = [
+ ]
+ 
+ [[bin]]
+-name = "zed"
++name = "zedp-rtl"
+ path = "src/main.rs"
+ 
+ [[bin]]

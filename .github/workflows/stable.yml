@@ -1,0 +1,88 @@
+name: Track stable Zed releases
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */4 * * *'
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: stable-${{ github.event.pull_request.number || 'release' }}
+  cancel-in-progress: false
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.lookup.outputs.tag }}
+      build: ${{ steps.lookup.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: lookup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            tag=$(jq -r .tag upstream.json)
+          else
+            tag=$(gh api repos/zed-industries/zed/releases/latest --jq .tag_name)
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+  windows:
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Apply the patch to the release
+        shell: pwsh
+        env:
+          UPSTREAM_TAG: ${{ needs.version.outputs.tag }}
+        run: ./build.ps1 -Tag $env:UPSTREAM_TAG -PrepareOnly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: build/zed-${{ needs.version.outputs.tag }} -> ../target
+          shared-key: windows-stable
+      - name: Build and test the upstream release
+        shell: pwsh
+        env:
+          UPSTREAM_TAG: ${{ needs.version.outputs.tag }}
+        run: ./build.ps1 -Tag $env:UPSTREAM_TAG -ReleaseRepository $env:GITHUB_REPOSITORY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: [version, windows]
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+      - name: Publish the tested Windows installer and its source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c ./*.sha256
+          gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "ZEDP-RTL ${TAG#v}" --notes "Windows x64 build based on upstream Zed $TAG."
